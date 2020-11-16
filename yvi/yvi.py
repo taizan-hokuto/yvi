@@ -3,10 +3,12 @@ import emoji
 import json
 import re
 import requests
+import time
 from . import util
-from . exceptions import InvalidVideoIdException, VideoInfoParseError
-
-pattern = re.compile(r"'PLAYER_CONFIG': ({.*}}})")
+from . exceptions import InvalidVideoIdException, VideoInfoParseError, PatternUnmatchError, UnknownConnectionError
+from requests.exceptions import HTTPError, ConnectTimeout, ConnectionError
+pattern = re.compile(r"['\"]PLAYER_CONFIG['\"]:\s*({.*})")
+pattern2 = re.compile(r"yt\.setConfig\((\{[\s\S]*?\})\);")
 
 item_channel_id = [
     "videoDetails",
@@ -25,6 +27,11 @@ item_renderer = [
 
 item_response = [
     "args",
+    "embedded_player_response"
+]
+
+item_response2 = [
+    "PLAYER_VARS",
     "embedded_player_response"
 ]
 
@@ -87,24 +94,58 @@ class VideoInfo:
             self.session = requests.Session()
 
         self.video_id = video_id
-        text = self._get_page_text(video_id)
-        self._parse(text)
+        self.new_pattern_text = False
+        for _ in range(3):
+            try:
+                text = self._get_page_text(video_id)
+                self._parse(text)
+                break
+            except PatternUnmatchError:
+                time.sleep(2)
+                pass
+        else:
+            raise PatternUnmatchError("Pattern Unmatch")
 
     def _get_page_text(self, video_id):
         url = f"https://www.youtube.com/embed/{video_id}"
-        resp = self.session.get(url)
-        resp.raise_for_status()
+        err = None
+        for _ in range(3):
+            try:
+                resp = self.session.get(url)
+                resp.raise_for_status()
+                break
+            except (HTTPError, ConnectTimeout, ConnectionError) as e:
+                err = e
+                time.sleep(3)
+        else:
+            raise UnknownConnectionError(str(err))
+
         return resp.text
+
 
     def _parse(self, text):
         result = re.search(pattern, text)
         if result is None:
-            raise VideoInfoParseError("Failed to parse video info.")
+            result = re.search(pattern2, text)
+            if result is None:
+                raise VideoInfoParseError("Failed to parse video info.")
+            else:
+                self.new_pattern_text = True
+
         decoder = json.JSONDecoder()
-        self._res = decoder.raw_decode(result.group(1)[:-1])[0]
-        response = self._get_item(self._res, item_response)
+        if self.new_pattern_text:
+            self._res = decoder.raw_decode(result.group(1))[0]
+        else:
+            self._res = decoder.raw_decode(result.group(1)[:-1])[0]
+        if self.new_pattern_text:
+            response = self._get_item(self._res, item_response2)
+        else:
+            response = self._get_item(self._res, item_response)
         if response is None:
-            self._check_video_is_private(self._res.get("args"))
+            if self.new_pattern_text:
+                self._check_video_is_private(self._res.get("PLAYER_VARS"))
+            else:
+                self._check_video_is_private(self._res.get("args"))
         self._renderer = self._get_item(json.loads(response), item_renderer)
         if self._renderer is None:
             raise InvalidVideoIdException(
